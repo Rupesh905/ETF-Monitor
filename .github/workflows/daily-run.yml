@@ -1,0 +1,38 @@
+name: Daily ETF Monitor
+
+on:
+  schedule:
+    - cron: '0 12 * * *'  # Runs at 7 AM EST (12 PM UTC)
+  workflow_dispatch:  # Allows you to run manually from phone
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install requests pandas beautifulsoup4
+    
+    - name: Run ETF Monitor
+      run: |
+        python -c "
+        from etf_monitor import ETFHoldingsMonitor
+        monitor = ETFHoldingsMonitor()
+        monitor.run_daily_check()
+        "
+    
+    - name: Commit and push reports
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add etf_data/
+        git diff --quiet && git diff --staged --quiet || (git commit -m "📊 Daily ETF report $(date +%Y-%m-%d)" && git push)
