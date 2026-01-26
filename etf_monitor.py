@@ -8,6 +8,8 @@ import json
 from datetime import datetime
 import os
 from pathlib import Path
+import csv
+from io import StringIO
 
 class ETFHoldingsMonitor:
     def __init__(self, data_dir="etf_data"):
@@ -18,35 +20,73 @@ class ETFHoldingsMonitor:
     def get_holdings_data(self):
         """Fetch current holdings data from iShares"""
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.ishares.com/us/products/239508/ishares-us-financials-etf',
         }
         
         try:
-            # Try to get holdings data - iShares uses dynamic loading
-            # We'll try to get the JSON data directly
-            holdings_url = f"{self.base_url}/1467271812596.ajax?tab=all&fileType=json"
-            
             print(f"Fetching data from iShares...")
+            
+            # Try JSON endpoint first
+            holdings_url = f"{self.base_url}/1467271812596.ajax?tab=all&fileType=json"
             response = requests.get(holdings_url, headers=headers, timeout=30)
             
             if response.status_code == 200:
-                data = response.json()
+                # Handle UTF-8 BOM if present
+                content = response.content.decode('utf-8-sig')
+                data = json.loads(content)
                 holdings = data.get('aaData', [])
                 
                 if holdings:
-                    print(f"Successfully fetched {len(holdings)} holdings")
+                    print(f"✓ Successfully fetched {len(holdings)} holdings via JSON")
                     return holdings
-                else:
-                    print("No holdings data found in response")
-                    return None
-            else:
-                print(f"Failed to fetch data. Status code: {response.status_code}")
-                return None
+            
+            # Fallback: Try CSV endpoint
+            print("Trying CSV endpoint...")
+            csv_url = f"{self.base_url}/1467271812596.ajax?fileType=csv&fileName=IXG_holdings&dataType=fund"
+            response = requests.get(csv_url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                content = response.content.decode('utf-8-sig')
+                
+                # Parse CSV
+                csv_reader = csv.reader(StringIO(content))
+                rows = list(csv_reader)
+                
+                # Skip header rows (usually first 10-12 rows are metadata)
+                data_start = 0
+                for i, row in enumerate(rows):
+                    if row and 'Ticker' in str(row):
+                        data_start = i + 1
+                        break
+                
+                holdings = []
+                for row in rows[data_start:]:
+                    if row and len(row) >= 3:
+                        # Skip empty or total rows
+                        if not row[0] or row[0].startswith('Total') or row[0].startswith('-'):
+                            continue
+                        holdings.append(row)
+                
+                if holdings:
+                    print(f"✓ Successfully fetched {len(holdings)} holdings via CSV")
+                    return holdings
+            
+            print("Failed to fetch data from both endpoints")
+            return None
                 
         except Exception as e:
             print(f"Error fetching data: {e}")
+            # Print more debug info
+            try:
+                print(f"Response status: {response.status_code}")
+                print(f"Response length: {len(response.content)}")
+                print(f"First 200 chars: {response.content[:200]}")
+            except:
+                pass
             return None
     
     def save_holdings(self, holdings):
@@ -67,7 +107,7 @@ class ETFHoldingsMonitor:
         with open(filename, 'w') as f:
             json.dump(data, f, indent=2)
         
-        print(f"Saved holdings to {filename}")
+        print(f"✓ Saved holdings to {filename}")
         return filename
     
     def load_previous_holdings(self):
@@ -83,6 +123,7 @@ class ETFHoldingsMonitor:
         try:
             with open(prev_file, 'r') as f:
                 data = json.load(f)
+                print(f"✓ Loaded previous data from {prev_file.name}")
                 return data
         except Exception as e:
             print(f"Error loading previous holdings: {e}")
@@ -99,18 +140,20 @@ class ETFHoldingsMonitor:
         
         previous_holdings = previous_data.get('holdings', [])
         
-        # Extract tickers and weights (assuming first column is ticker, third is weight)
+        # Extract tickers and weights
         def extract_info(holdings):
             info = {}
             for h in holdings:
                 if len(h) >= 3:
-                    ticker = h[0]  # Usually ticker symbol
-                    name = h[1] if len(h) > 1 else ""
-                    weight = h[2] if len(h) > 2 else "0"
-                    info[ticker] = {
-                        'name': name,
-                        'weight': weight
-                    }
+                    ticker = str(h[0]).strip()
+                    name = str(h[1]).strip() if len(h) > 1 else ""
+                    weight_str = str(h[2]).strip() if len(h) > 2 else "0"
+                    
+                    if ticker and ticker != '-':
+                        info[ticker] = {
+                            'name': name,
+                            'weight': weight_str
+                        }
             return info
         
         current_info = extract_info(current_holdings)
@@ -125,8 +168,8 @@ class ETFHoldingsMonitor:
         # Find weight changes
         weight_changes = []
         for ticker in current_tickers.intersection(previous_tickers):
-            curr_weight_str = str(current_info[ticker]['weight']).replace('%', '').strip()
-            prev_weight_str = str(previous_info[ticker]['weight']).replace('%', '').strip()
+            curr_weight_str = str(current_info[ticker]['weight']).replace('%', '').replace(',', '').strip()
+            prev_weight_str = str(previous_info[ticker]['weight']).replace('%', '').replace(',', '').strip()
             
             try:
                 curr_weight = float(curr_weight_str) if curr_weight_str else 0
@@ -227,7 +270,12 @@ class ETFHoldingsMonitor:
         current_holdings = self.get_holdings_data()
         
         if not current_holdings:
-            print("\n❌ Failed to fetch holdings data. Please try again later.")
+            print("\n❌ Failed to fetch holdings data.")
+            print("This could be due to:")
+            print("  - iShares website format change")
+            print("  - Network connectivity issues")
+            print("  - Rate limiting")
+            print("\nWill retry on next scheduled run.")
             return None
         
         # Save current data
@@ -265,6 +313,7 @@ def main():
         print("\n✅ Daily check completed successfully!")
     else:
         print("\n⚠️  Daily check completed with warnings")
+        print("The script will automatically retry tomorrow.")
 
 if __name__ == "__main__":
     main()
